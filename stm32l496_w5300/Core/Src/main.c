@@ -32,11 +32,15 @@
 
 #include "ff.h"
 #include "general_sdcard.h"
+
+#include "httpServer.h"
+#include "webpage.h"
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+#define DATA_BUF_SIZE   1024
 #define _USE_W5300_OPTIMIZE				1
 
 #define W5300_BANK_ADDR                 ((uint32_t)0x60000000)//((uint32_t)0x64000000)
@@ -58,6 +62,8 @@
 #define	SD_CS_PORT			GPIOA
 #define SD_CS_PIN			GPIO_PIN_4
 
+#define MAX_HTTPSOCK	6
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -67,10 +73,24 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
+typedef enum
+{
+	NotUsed	= 0,
+	Input	= 1,
+	Output	= 2
+} IO_Direction_Type;
+// Data IO Status
+typedef enum
+{
+	Off	= 0,
+	On 	= 1
+} IO_Status_Type;
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+ADC_HandleTypeDef hadc3;
+
 UART_HandleTypeDef hlpuart1;
 
 RTC_HandleTypeDef hrtc;
@@ -97,19 +117,26 @@ wiz_NetInfo gWIZNETINFO = {
 		.dns = {8, 8, 8, 8},
 		.dhcp = NETINFO_STATIC
 };
-
+uint32_t raw1;
+  uint32_t raw2;
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
+void PeriphCommonClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_LPUART1_UART_Init(void);
 static void MX_FMC_Init(void);
 static void MX_RTC_Init(void);
 static void MX_SPI1_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_ADC3_Init(void);
 /* USER CODE BEGIN PFP */
 uint8_t rxData[2];
+void make_json_dio(uint8_t * buf, uint16_t * len, uint8_t pin);
+void make_json_ain(uint8_t * buf, uint16_t * len, uint8_t pin);
+void make_json_netinfo(uint8_t * buf, uint16_t * len);
 
 int _write(int fd, char *str, int len)
 {
@@ -166,6 +193,235 @@ void print_network_information(void)
     printf("SM Mask    : %d.%d.%d.%d\n\r",gWIZNETINFO.sn[0],gWIZNETINFO.sn[1],gWIZNETINFO.sn[2],gWIZNETINFO.sn[3]);
     printf("Gate way   : %d.%d.%d.%d\n\r",gWIZNETINFO.gw[0],gWIZNETINFO.gw[1],gWIZNETINFO.gw[2],gWIZNETINFO.gw[3]);
     printf("DNS Server : %d.%d.%d.%d\n\r",gWIZNETINFO.dns[0],gWIZNETINFO.dns[1],gWIZNETINFO.dns[2],gWIZNETINFO.dns[3]);
+}
+
+void make_json_dio(uint8_t * buf, uint16_t * len, uint8_t pin)
+{
+	//uint8_t pin_state 	= Chip_GPIO_GetPinState(LPC_GPIO, dio_ports[pin], dio_pins[pin]);
+	//uint8_t pin_dir 	= Chip_GPIO_GetPinDIR(LPC_GPIO, dio_ports[pin], dio_pins[pin]);
+
+	*len = sprintf((char *)buf, "DioCallback({\"dio_p\":\"%d\",\
+											\"dio_s\":\"%d\",\
+											\"dio_d\":\"%d\"\
+											});",
+											1,					// Digital io pin number
+											2,				// Digital io status
+											3					// Digital io directions
+											);
+}
+
+void make_json_ain(uint8_t * buf, uint16_t * len, uint8_t pin)
+{
+	*len = sprintf((char *)buf, "AinCallback({\"ain_p\":\"%d\",\
+											\"ain_v\":\"%d\"\
+											});",
+											0,					// ADC input pin number
+											raw1//get_ADC_val(pin)		// ADC input value
+											);
+}
+
+void make_json_netinfo(uint8_t * buf, uint16_t * len)
+{
+	wiz_NetInfo netinfo;
+	ctlnetwork(CN_GET_NETINFO, (void*) &netinfo);
+
+	// DHCP: 1 - Static, 2 - DHCP
+	*len = sprintf((char *)buf, "NetinfoCallback({\"mac\":\"%.2X:%.2X:%.2X:%.2X:%.2X:%.2X\",\
+											\"ip\":\"%d.%d.%d.%d\",\
+											\"gw\":\"%d.%d.%d.%d\",\
+											\"sn\":\"%d.%d.%d.%d\",\
+											\"dns\":\"%d.%d.%d.%d\",\
+											\"dhcp\":\"%d\"\
+											});",
+											netinfo.mac[0], netinfo.mac[1], netinfo.mac[2], netinfo.mac[3], netinfo.mac[4], netinfo.mac[5],
+											netinfo.ip[0], netinfo.ip[1], netinfo.ip[2], netinfo.ip[3],
+											netinfo.gw[0], netinfo.gw[1], netinfo.gw[2], netinfo.gw[3],
+											netinfo.sn[0], netinfo.sn[1], netinfo.sn[2], netinfo.sn[3],
+											netinfo.dns[0], netinfo.dns[1], netinfo.dns[2], netinfo.dns[3],
+											netinfo.dhcp
+											);
+}
+
+uint8_t predefined_get_cgi_processor(uint8_t * uri_name, uint8_t * buf, uint16_t * len)
+{
+	uint8_t ret = 1;	// ret = 1 means 'uri_name' matched
+	uint8_t cgibuf[14] = {0, };
+	int8_t cgi_dio = -1;
+	int8_t cgi_ain = -1;
+
+	uint8_t i;
+
+	if(strcmp((const char *)uri_name, "todo.cgi") == 0)
+	{
+		// to do
+		;//make_json_todo(buf, len);
+	}
+	else if(strcmp((const char *)uri_name, "get_netinfo.cgi") == 0)
+	{
+		make_json_netinfo(buf, len);
+	}
+	else
+	{
+		// get_dio0.cgi ~ get_dio15.cgi
+#if 1
+		//for(i = 0; i < DIOn; i++)
+		for(i = 0; i < 16; i++)
+		{
+			memset(cgibuf, 0x00, 14);
+			sprintf((char *)cgibuf, "get_dio%d.cgi", i);
+			if(strcmp((const char *)uri_name, (const char *)cgibuf) == 0)
+			{
+				make_json_dio(buf, len, i);
+				cgi_dio = i;
+				break;
+			}
+		}
+#endif
+		if(cgi_dio < 0)
+		{
+			// get_ain0.cgi ~ get_ain5.cgi (A0 - A5), get_ain6.cgi for on-board potentiometer / Temp.Sensor
+			for(i = 0; i < 7; i++)
+			{
+				memset(cgibuf, 0x00, 14);
+				sprintf((char *)cgibuf, "get_ain%d.cgi", i);
+				if(strcmp((const char *)uri_name, (const char *)cgibuf) == 0)
+				{
+					make_json_ain(buf, len, i);
+					cgi_ain = i;
+					break;
+				}
+			}
+		}
+
+		if((cgi_dio < 0) && (cgi_ain < 0)) ret = 0;
+	}
+
+	return ret;
+}
+#if 1
+int8_t set_diodir(uint8_t * uri)
+{
+	uint8_t * param;
+	uint8_t pin = 9, val = 0;
+	GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+	if((param = get_http_param_value((char *)uri, "pin"))) // GPIO; D0 ~ D15
+	{
+		pin = (uint8_t)ATOI(param, 10);
+		if(pin > 15) return -1;
+
+		if((param = get_http_param_value((char *)uri, "val")))  // Direction; NotUsed/Input/Output
+		{
+			val = (uint8_t)ATOI(param, 10);
+			if(val > Output) val = Output;
+		}
+	}
+
+	if(val == Input)
+	{
+		GPIO_InitStruct.Pin = GPIO_PIN_9;
+		GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+		GPIO_InitStruct.Pull = GPIO_NOPULL;
+		HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
+	//Chip_GPIO_SetPinDIRInput(LPC_GPIO, dio_ports[pin], dio_pins[pin]);	// Input
+	}
+	else
+	{
+		GPIO_InitStruct.Pin = GPIO_PIN_9;
+		GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+		GPIO_InitStruct.Pull = GPIO_NOPULL;
+		HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
+	//Chip_GPIO_SetPinDIROutput(LPC_GPIO, dio_ports[pin], dio_pins[pin]); // Output
+	}
+
+	return pin;
+}
+
+int8_t set_diostate(uint8_t * uri)
+{
+	uint8_t * param;
+	uint8_t pin = 0, val = 0;
+	GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+	if((param = get_http_param_value((char *)uri, "pin"))) // GPIO; D0 ~ D15
+	{
+		pin = (uint8_t)ATOI(param, 10);
+		if(pin > 15) return -1;
+
+		if((param = get_http_param_value((char *)uri, "val")))  // State; high(on)/low(off)
+		{
+			val = (uint8_t)ATOI(param, 10);
+			if(val > On) val = On;
+		}
+		printf("[DEBUG]set_diostatue pin= %d, val = %d\r\n", pin, val);
+		if(val == On)
+		{
+			if(pin == 8 )	// LED RED PB14
+			{
+				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
+			}
+			else if(pin == 10) //LED BLUE PB4
+			{
+				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, GPIO_PIN_SET);
+			}
+			else if(pin == 0)
+			{
+				HAL_GPIO_WritePin(GPIOF, GPIO_PIN_9, GPIO_PIN_SET);
+			}
+
+		//Chip_GPIO_SetPinState(LPC_GPIO, dio_ports[pin], dio_pins[pin], true); 	// High
+		}
+		else
+		{
+			if(pin == 8 )	// LED RED PB14
+			{
+				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
+			}
+			else if(pin == 10) //LED BLUE PB4
+			{
+				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, GPIO_PIN_RESET);
+			}
+			else if(pin == 0)
+			{
+				HAL_GPIO_WritePin(GPIOF, GPIO_PIN_9, GPIO_PIN_RESET);
+			}
+		//Chip_GPIO_SetPinState(LPC_GPIO, dio_ports[pin], dio_pins[pin], false);	// Low
+		}
+	}
+
+	return pin;
+}
+#endif
+uint8_t predefined_set_cgi_processor(uint8_t * uri_name, uint8_t * uri, uint8_t * buf, uint16_t * len)
+{
+	uint8_t ret = 1;	// ret = '1' means 'uri_name' matched
+	uint8_t val = 0;
+
+	if(strcmp((const char *)uri_name, "todo.cgi") == 0)
+	{
+		// to do
+		;//val = todo(uri);
+		//*len = sprintf((char *)buf, "%d", val);
+	}
+	// Digital I/O; dio_s, dio_d
+	else if(strcmp((const char *)uri_name, "set_diodir.cgi") == 0)
+	{
+		//val = set_diodir(uri);
+		val = 0;
+		*len = sprintf((char *)buf, "%d", val);
+	}
+	else if(strcmp((const char *)uri_name, "set_diostate.cgi") == 0)
+	{
+		//val = set_diostate(uri);
+		val = 0;
+		*len = sprintf((char *)buf, "%d", val);
+	}
+	else
+	{
+		ret = 0;
+	}
+
+	return ret;
 }
 
 void _InitW5300(void)
@@ -295,6 +551,10 @@ int test_SD_Card1(void)
 	if(f_mount(NULL, "", 1) != FR_OK)
 		printf("ERROR f:%s, L:%d\r\n", __FILE__, __LINE__);
 }
+void systic_timmer(void)
+{
+	httpServer_time_handler();
+}
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -310,6 +570,11 @@ int main(void)
 {
   /* USER CODE BEGIN 1 */
   char ret = 0;
+
+  uint8_t RX_BUF[DATA_BUF_SIZE];
+  uint8_t TX_BUF[DATA_BUF_SIZE];
+  int i=0;
+uint8_t socknumlist[] = {2, 3, 4, 5, 6, 7};
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -324,6 +589,9 @@ int main(void)
   /* Configure the system clock */
   SystemClock_Config();
 
+/* Configure the peripherals common clocks */
+  PeriphCommonClock_Config();
+
   /* USER CODE BEGIN SysInit */
 
   /* USER CODE END SysInit */
@@ -335,6 +603,8 @@ int main(void)
   MX_RTC_Init();
   MX_SPI1_Init();
   MX_FATFS_Init();
+  MX_ADC1_Init();
+  MX_ADC3_Init();
   /* USER CODE BEGIN 2 */
   //printf("Hello! W5300 BUS loopback System \r\n");
   HAL_UART_Receive_IT(&hlpuart1, rxData, 1);
@@ -351,6 +621,37 @@ int main(void)
   //testFunc();
   //test_SD_Card();
   //test_SD_Card1();
+  httpServer_init(TX_BUF, RX_BUF, MAX_HTTPSOCK, socknumlist);		// Tx/Rx buffers (1kB) / The number of W5500 chip H/W sockets in use
+	reg_httpServer_cbfunc(NVIC_SystemReset, NULL); 					// Callback: NXP MCU Reset
+
+	{
+		/* Web content registration (web content in webpage.h, Example web pages) */
+
+		// Index page and netinfo / base64 image demo
+		reg_httpServer_webContent((uint8_t *)"index.html", (uint8_t *)index_page);				// index.html 		: Main page example
+		reg_httpServer_webContent((uint8_t *)"netinfo.html", (uint8_t *)netinfo_page);			// netinfo.html 	: Network information example page
+		reg_httpServer_webContent((uint8_t *)"netinfo.js", (uint8_t *)wiz550web_netinfo_js);	// netinfo.js 		: JavaScript for Read Network configuration 	(+ ajax.js)
+		reg_httpServer_webContent((uint8_t *)"img.html", (uint8_t *)img_page);					// img.html 		: Base64 Image data example page
+
+		// Example #1
+		reg_httpServer_webContent((uint8_t *)"dio.html", (uint8_t *)dio_page);					// dio.html 		: Digital I/O control example page
+		reg_httpServer_webContent((uint8_t *)"dio.js", (uint8_t *)wiz550web_dio_js);			// dio.js 			: JavaScript for digital I/O control 	(+ ajax.js)
+
+		// Example #2
+		reg_httpServer_webContent((uint8_t *)"ain.html", (uint8_t *)ain_page);					// ain.html 		: Analog input monitor example page
+		reg_httpServer_webContent((uint8_t *)"ain.js", (uint8_t *)wiz550web_ain_js);			// ain.js 			: JavaScript for Analog input monitor	(+ ajax.js)
+
+		// Example #3
+		reg_httpServer_webContent((uint8_t *)"ain_gauge.html", (uint8_t *)ain_gauge_page);		// ain_gauge.html 	: Analog input monitor example page; using Google Gauge chart
+		reg_httpServer_webContent((uint8_t *)"ain_gauge.js", (uint8_t *)ain_gauge_js);			// ain_gauge.js 	: JavaScript for Google Gauge chart		(+ ajax.js)
+
+		// AJAX JavaScript functions
+		reg_httpServer_webContent((uint8_t *)"ajax.js", (uint8_t *)wiz550web_ajax_js);			// ajax.js			: JavaScript for AJAX request transfer
+
+  #ifdef _MAIN_DEBUG_
+  		display_reg_webContent_list();
+  #endif
+  	}
   while (1)
   {
 	 //loopback_tcps(0, ethBuf0, 3000);
@@ -358,7 +659,14 @@ int main(void)
 	{
 		porintf(" FTP server Error %d \r\n", ret);
 	}
-
+	HAL_ADC_Start(&hadc1);
+	HAL_ADC_Start(&hadc3);
+	HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY);
+	HAL_ADC_PollForConversion(&hadc3, HAL_MAX_DELAY);
+	raw1 = HAL_ADC_GetValue(&hadc1);
+	raw2 = HAL_ADC_GetValue(&hadc3);
+	for(i = 0; i < MAX_HTTPSOCK; i++)	httpServer_run(i); 	// HTTP Server handler
+	//printf("adc1 = %d, %d\r\n", raw1, raw2);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -415,6 +723,156 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief Peripherals Common Clock Configuration
+  * @retval None
+  */
+void PeriphCommonClock_Config(void)
+{
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
+
+  /** Initializes the peripherals clock
+  */
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
+  PeriphClkInit.AdcClockSelection = RCC_ADCCLKSOURCE_PLLSAI1;
+  PeriphClkInit.PLLSAI1.PLLSAI1Source = RCC_PLLSOURCE_MSI;
+  PeriphClkInit.PLLSAI1.PLLSAI1M = 1;
+  PeriphClkInit.PLLSAI1.PLLSAI1N = 24;
+  PeriphClkInit.PLLSAI1.PLLSAI1P = RCC_PLLP_DIV2;
+  PeriphClkInit.PLLSAI1.PLLSAI1Q = RCC_PLLQ_DIV2;
+  PeriphClkInit.PLLSAI1.PLLSAI1R = RCC_PLLR_DIV2;
+  PeriphClkInit.PLLSAI1.PLLSAI1ClockOut = RCC_PLLSAI1_ADC1CLK;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_MultiModeTypeDef multimode = {0};
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Common config
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV1;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc1.Init.LowPowerAutoWait = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+  hadc1.Init.OversamplingMode = DISABLE;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure the ADC multi-mode
+  */
+  multimode.Mode = ADC_MODE_INDEPENDENT;
+  if (HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_8;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
+  sConfig.SingleDiff = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset = 0;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief ADC3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC3_Init(void)
+{
+
+  /* USER CODE BEGIN ADC3_Init 0 */
+
+  /* USER CODE END ADC3_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC3_Init 1 */
+
+  /* USER CODE END ADC3_Init 1 */
+
+  /** Common config
+  */
+  hadc3.Instance = ADC3;
+  hadc3.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV1;
+  hadc3.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc3.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc3.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc3.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc3.Init.LowPowerAutoWait = DISABLE;
+  hadc3.Init.ContinuousConvMode = DISABLE;
+  hadc3.Init.NbrOfConversion = 1;
+  hadc3.Init.DiscontinuousConvMode = DISABLE;
+  hadc3.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc3.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc3.Init.DMAContinuousRequests = DISABLE;
+  hadc3.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+  hadc3.Init.OversamplingMode = DISABLE;
+  if (HAL_ADC_Init(&hadc3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_1;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
+  sConfig.SingleDiff = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset = 0;
+  if (HAL_ADC_ConfigChannel(&hadc3, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC3_Init 2 */
+
+  /* USER CODE END ADC3_Init 2 */
+
 }
 
 /**
@@ -604,6 +1062,9 @@ static void MX_GPIO_Init(void)
   HAL_PWREx_EnableVddIO2();
 
   /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOF, GPIO_PIN_9, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
@@ -626,6 +1087,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PF9 */
+  GPIO_InitStruct.Pin = GPIO_PIN_9;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
 
   /*Configure GPIO pin : PA4 */
   GPIO_InitStruct.Pin = GPIO_PIN_4;
